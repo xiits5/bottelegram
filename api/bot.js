@@ -5,11 +5,14 @@
 // Никаких сторонних библиотек — только встроенный fetch.
 
 const TELEGRAM_API = 'https://api.telegram.org';
-const GEMINI_API = 'https://generativelanguage.googleapis.com/v1beta/models';
+// С мая 2026 Google перевела Gemini API на новый эндпоинт Interactions API
+// (старый /v1beta/models/{model}:generateContent для новых пользователей отдаёт 404)
+const GEMINI_API = 'https://generativelanguage.googleapis.com/v1beta/interactions';
 
-// Модель Gemini (в задаче указано «Gemeni 2.5 flash» — это модель
-// gemini-2.5-flash в API Google)
-const MODEL = 'gemini-2.5-flash';
+// Модель Gemini (в задаче указано «Gemeni 2.5 flash»; gemini-2.5-flash больше
+// не выдаётся новым пользователям — Google в ответе API прямо рекомендует
+// перейти на gemini-3.6-flash)
+const MODEL = 'gemini-3.6-flash';
 
 // Системный промпт: роль, правила и данные фитнес-зала для ИИ
 const SYSTEM_PROMPT = `Ты — ассистент фитнес-зал - ФОРС АРЕНА в Семей. Отвечай кратко, дружелюбно, на русском (клиент пишет на казахском — отвечай на казахском). Правила:
@@ -133,20 +136,44 @@ async function sendMessage(botToken, chatId, text) {
   }
 }
 
-// Запрос к Gemini API: перед вопросом пользователя подставляется SYSTEM_PROMPT
-async function askGemini(geminiKey, userText) {
-  const url = `${GEMINI_API}/${MODEL}:generateContent?key=${geminiKey}`;
+// Извлекает текст ответа модели из ответа Interactions API
+// (steps[].content[].text, где step.type === 'model_output')
+function extractInteractionText(data) {
+  if (data && typeof data.output_text === 'string' && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
 
-  const response = await fetch(url, {
+  if (!data || !Array.isArray(data.steps)) {
+    return null;
+  }
+
+  const parts = [];
+  for (const step of data.steps) {
+    if (step?.type !== 'model_output' || !Array.isArray(step.content)) continue;
+    for (const item of step.content) {
+      if (item?.type === 'text' && typeof item.text === 'string') {
+        parts.push(item.text);
+      }
+    }
+  }
+
+  const text = parts.join('\n').trim();
+  return text || null;
+}
+
+// Запрос к Gemini API (Interactions API): SYSTEM_PROMPT передаётся как
+// системная инструкция перед вопросом пользователя
+async function askGemini(geminiKey, userText) {
+  const response = await fetch(GEMINI_API, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': geminiKey,
+    },
     body: JSON.stringify({
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: `${SYSTEM_PROMPT}\n\nВопрос клиента: ${userText}` }],
-        },
-      ],
+      model: MODEL,
+      system_instruction: SYSTEM_PROMPT,
+      input: userText,
     }),
   });
 
@@ -163,14 +190,20 @@ async function askGemini(geminiKey, userText) {
   }
 
   const data = await response.json();
-  const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+  if (data?.status === 'failed' || (Array.isArray(data?.errors) && data.errors.length)) {
+    console.error('Gemini API: failed interaction', JSON.stringify(data));
+    throw new Error('Gemini API: failed interaction');
+  }
+
+  const answer = extractInteractionText(data);
 
   if (!answer) {
     console.error('Gemini API: empty response', JSON.stringify(data));
     throw new Error('Gemini API: empty response');
   }
 
-  return answer.trim();
+  return answer;
 }
 
 module.exports = async (req, res) => {
